@@ -1,0 +1,159 @@
+-module(analyze_meter_field_server).
+
+-behavior(gen_server).
+
+-include("analyze.hrl").
+-include("analyze_config.hrl").
+
+-export([start_link/0]).
+-export([insert_meter_field/1]).
+-export([
+         read_part/6
+        ]).
+
+-export([
+         init/1,
+         handle_call/3,
+         handle_cast/2,
+         handle_info/2,
+         terminate/2,
+         code_change/3
+         ]).
+
+-define(SERVER, ?MODULE).
+
+-record(state, {}).
+
+start_link() ->
+    gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
+
+insert_meter_field(MeterFieldList) ->
+    gen_server:cast(?SERVER, {insert_meter_field, MeterFieldList}).
+
+init([]) ->
+    State = #state{},
+    %State = 1,
+    %% 创建ets表
+    analyze_meter_field_store:init(),
+    %% 加载配表配置信息
+    {ok, PidCount} = load_config(),
+    %wait_child(PidCount),
+    {ok, State, hibernate}.
+
+handle_call(_Request, _From, State) ->
+    {noreply, State}.
+
+handle_cast({insert_meter_field, MeterFieldList}, State) ->
+    %io:format("~p: ~p~n", [State, 1]),
+    analyze_meter_field_store:insert(MeterFieldList),
+    {noreply, State};
+handle_cast(_Request, State) ->
+    {noreply, State}.
+
+handle_info(_Info, State) ->
+    {noreply, State}.
+
+terminate(Reason, State) ->
+    ok.
+
+code_change(_OldVsn, State, _Extra) ->
+    {ok, State}.
+
+wait_child(0) ->
+    io:format("~p~n", ["haha"]),
+    ok;
+wait_child(PidCount) ->
+    receive
+        {_, done} ->
+            ok
+    end,
+    wait_child(PidCount-1).
+              
+load_config() ->
+    Meter_config_file = ?METERS_CONFIG,
+    case file:read_file(Meter_config_file) of
+        {ok, Binary} ->
+            Len = 81,
+            PieceSize = 10000,
+            AllLen = binary:referenced_byte_size(Binary),
+            RecordCount = AllLen div 81,
+            ProcessCount = RecordCount div PieceSize,
+            LastPieceSize = RecordCount rem PieceSize,         
+            {ok, ReportIntervalList} = file:consult("./rel/report_interval.config"),
+            handle_binary(Binary, Len, PieceSize, ProcessCount-1, self(), ReportIntervalList),
+            read_part(Binary, Len, LastPieceSize, ProcessCount, self(), ReportIntervalList),            
+            {ok, ProcessCount};
+        {error, Reason} -> {error, Reason}
+    end.
+
+handle_binary(Binary, Len, PieceSize, ProcessNum, Parent, ReportIntervalList) when (ProcessNum >= 0) ->
+    spawn(?MODULE, read_part, [Binary, Len, PieceSize, ProcessNum, Parent, ReportIntervalList]),
+    handle_binary(Binary, Len, PieceSize, ProcessNum-1, Parent, ReportIntervalList);
+handle_binary(_, _, _, _, _, _) ->
+    ok.
+
+read_part(Binary, Len, PieceSize, ProcessNum, Parent, ReportIntervalList) ->
+    read_each_line(Binary, Len, PieceSize, PieceSize-1, ProcessNum, 0, [], ReportIntervalList),
+    %Parent ! {self(), done}.
+    ok.
+
+read_each_line(Binary, Len, PieceSize, CurPiece, ProcessNum, ListLen, MeterFieldList, ReportIntervalList) 
+  when (CurPiece >= 0)->
+    LineBin = binary:part(Binary, ProcessNum*PieceSize*Len+CurPiece*Len, Len),
+    LineStr = binary_to_list(LineBin),
+    MeterInfo = string:strip(string:strip(LineStr, both, $\n)),
+    %io:format("~p~n", [MeterInfo]),
+    case get_meter_field_by_meter_info(MeterInfo, ReportIntervalList) of
+        {ok, MeterField} ->
+            case ListLen >= 60 of
+                true ->
+                    ?MODULE:insert_meter_field(MeterFieldList),
+                    read_each_line(Binary, Len, PieceSize, CurPiece-1, ProcessNum, 0, [MeterField], ReportIntervalList);
+                false ->
+                    read_each_line(Binary, Len, PieceSize, CurPiece-1, ProcessNum, ListLen+1, [MeterField | MeterFieldList], ReportIntervalList)
+            end;
+        {error, Reason} ->
+            read_each_line(Binary, Len, PieceSize, CurPiece-1, ProcessNum, ListLen, MeterFieldList, ReportIntervalList)
+    end;
+read_each_line(_, _, _, CurPiece, ProcessNum, ListLen, MeterFieldList, ReportIntervalList) when (MeterFieldList =/= []) ->
+    ?MODULE:insert_meter_field(MeterFieldList),
+    ok;
+read_each_line(_, _, _, _, _, _, _, _) ->
+    ok.
+
+get_meter_field_by_meter_info(Meter_info, ReportIntervalList) ->
+    case string:tokens(Meter_info, "#") of
+        [Meter_type, Meter, Gateway, Build_id, Master_label, Slave_label] ->
+            {ok, build_meter_field({Meter_type, Meter, Gateway, Build_id, Master_label, Slave_label}, ReportIntervalList)};
+        [Meter_type, Meter, Gateway, Build_id, Master_label] ->
+            {ok, build_meter_field({Meter_type, Meter, Gateway, Build_id, Master_label, ?DEFAULT_SLAVE_LABEL}, ReportIntervalList)};
+        _ ->
+            {error, parse_error}
+    end.
+
+%% 构建表信息字段
+build_meter_field({Meter_type, Meter, Gateway, Build_id, Master_label, Slave_label}, ReportIntervalList) ->
+    #meter_field{
+       key = {Meter_type, Meter},
+       meter_type = Meter_type,
+       meter = Meter,                  
+       gateway = Gateway,          
+       build_id = Build_id,           
+       master_label = Master_label,
+       slave_label = Slave_label,
+       report_interval = proplists:get_value(Meter_type, ReportIntervalList, ?DEFAULT_REPORT_INTERVAL)
+    }.
+
+%% 解析配表信息返回Meter_type, Meter, Meter_field
+%get_meter_type_and_meter_and_meter_field_by_meter_info(Meter_info) ->
+ %   case get_meter_field_by_meter_info(Meter_info) of
+  %      {ok, Meter_field} ->
+   %         {ok, Meter_field#meter_field.meter_type, Meter_field#meter_field.meter, Meter_field};
+    %    {error, Reason} ->
+     %       {error, Reason}
+    %end.
+
+
+
+
+

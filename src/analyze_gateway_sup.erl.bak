@@ -1,0 +1,157 @@
+-module(analyze_gateway_sup).
+
+-behaviour(supervisor).
+
+-include("analyze.hrl").
+-include("analyze_config.hrl").
+-include("print.hrl").
+
+-export([start_link/0]).
+
+-export([init/1]).
+
+-export([create_process/1,
+         remove_process/1
+        ]).
+
+-export([system_continue/3,
+         system_terminate/4,
+         system_code_change/4
+]).
+
+-define(CHILD_MOD, analyze_gateway).
+-define(SERVER, ?MODULE).
+-record(state, {parent, child_mod}).
+
+
+%%============================================================================================
+%% API
+%%============================================================================================
+
+start_link() ->
+    proc_lib:start_link(?MODULE, init, [self()]).
+
+create_process(Gateway) ->
+    ?SERVER ! {create_process, Gateway}.
+
+remove_process(Gateway) ->
+    ?SERVER ! {remove_process, Gateway}.
+
+%%============================================================================================
+%% API end
+%%============================================================================================-
+
+init(Parent) ->
+    process_flag(trap_exit, true),
+    ?HELP:register_name(?MODULE, self()),
+
+    Child_mod = ?CHILD_MOD,
+
+    %% 初始化各种存储关系
+    init_relationship(),
+
+    spawn_virtual_gateway(Child_mod),
+    
+    State = #state{
+        parent = Parent,
+        child_mod = Child_mod     
+    }, 
+    ok = proc_lib:init_ack(Parent, {ok, self()}),
+    loop(State).
+
+loop(#state{parent = Parent, child_mod = Child_mod } = State) ->
+    receive
+        {create_process, Gateway} ->
+            do_create_process(Gateway),
+            loop(State);
+        {remove_process, Gateway} ->
+            do_remove_process(Gateway),
+            loop(State);
+        {'EXIT', Parent, Reason} ->
+            exit(Reason);
+        %% 捕获与之连接的进程退出信息
+        {'EXIT', From, Reason} when Reason =:= normal; Reason =:= shutdown ->
+            ?ERROR("Pid:~p exit reason: ~p~n", [From, shutdown]),
+            loop(State);
+        {'EXIT', From, Reason} ->
+            ?ERROR("Pid:~p exit reason: ~p~n", [From, Reason]),
+            %% 重启
+            case analyze_gateway_pid:lookup_by_pid(From) of
+                {ok, Gateway} ->
+                    ?ERROR("Gateway:~p restart~n", [Gateway]),
+                    create_gateway_child(Gateway, Child_mod);
+                {error, What} ->
+                    ?ERROR("analyze_gateway_pid lookup_by_pid(~p) is error:~p~n", [From, What])
+            end,
+            loop(State);
+        {system, From, Request} ->
+            sys:handle_system_msg(Request, From, Parent, ?MODULE, [],
+                {State});
+        Other ->
+            ?ERROR("~p Other:~p~n", [?MODULE, Other]),
+            loop(State)
+    end.
+
+system_continue(_, _, {State}) ->
+    loop(State).
+
+-spec system_terminate(any(), _, _, _) -> no_return().
+system_terminate(Reason, _, _, _) ->
+    exit(Reason).
+
+system_code_change(Misc, _, _, _) ->
+    {ok, Misc}.
+
+
+%% Internal functions
+
+init_relationship() ->
+    analyze_gateway_pid:init(),
+    analyze_gateway_status:init(),
+    ok.
+
+spawn_virtual_gateway(Child_mod) ->
+    Fun =
+        fun(Item, {Count, Start}) ->
+                Gateway = analyze_gateway_meter:get_gateway(Item),
+                case create_gateway_child(Gateway, Child_mod) of
+                    {ok, _Pid} ->
+                        {Count+1, Start+1};
+                    {error, Reason} ->
+                        ?ERROR("~p spawn error:~p~n", [Gateway, Reason]), 
+                        {Count+1, Start}
+                end
+        end,
+    {Count, Start} = analyze_gateway_meter:foldl(Fun, {0, 0}),
+    ?PRINT("Count ~p Gateway of meters is Started ~p~n", [Count, Start]),
+    ok.
+
+do_create_process(Gateway) ->    
+    create_gateway_child(Gateway, ?CHILD_MOD).
+
+do_remove_process(Gateway) ->
+    case analyze_gateway_pid:lookup(Gateway) of
+        {ok, Pid} ->
+            exit(Pid, shutdown),
+            delete_from_gateway_pid_ets(Gateway);
+        _ ->
+            ok
+    end.
+
+%% create gateway child
+create_gateway_child(Gateway, Child_mod) ->
+    {ok, Pid} = Child_mod:start_link(Gateway),
+    insert_to_gateway_pid_ets(Gateway, Pid),
+    {ok, Pid}.
+
+%% insert(Gateway_Code, Pid) to ets
+insert_to_gateway_pid_ets(Gateway, Pid) ->
+    analyze_gateway_pid:insert(Gateway, Pid).
+
+delete_from_gateway_pid_ets(Gateway) ->
+    analyze_gateway_pid:delete(Gateway).
+
+    
+
+
+

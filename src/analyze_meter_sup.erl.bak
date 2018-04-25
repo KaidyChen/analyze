@@ -1,0 +1,372 @@
+-module(analyze_meter_sup).
+
+-behaviour(supervisor).
+
+-include("analyze.hrl").
+-include("analyze_config.hrl").
+-include("analyze_meter.hrl").
+-include("print.hrl").
+
+-export([start_link/0]).
+
+-export([init/1]).
+
+-export([system_continue/3,
+         system_terminate/4,
+         system_code_change/4
+]).
+
+%% public API
+-export([add_meters/1,
+         del_meters/1,
+         batch_update_build/1,
+         delete_meters_by_gateway/1
+]).
+
+-define(SERVER, ?MODULE).
+
+-record(state, {parent}).
+
+%%============================================================================================
+%% API
+%%============================================================================================
+
+start_link() ->
+    proc_lib:start_link(?MODULE, init, [self()]).
+
+add_meters(MeterFieldList) ->
+    ?SERVER ! {add_meters, MeterFieldList}.
+
+del_meters(MeterTypeAndMeterList) ->
+    ?SERVER ! {del_meters, MeterTypeAndMeterList}.
+
+batch_update_build(MeterTypeAndMeterAndBuildIdList) ->
+    ?SERVER ! {batch_update_build, MeterTypeAndMeterAndBuildIdList}.
+
+delete_meters_by_gateway(Gateway) ->
+    ?SERVER ! {delete_meters_by_gateway, Gateway}.
+
+%%============================================================================================
+%% API end
+%%============================================================================================-
+
+init(Parent) ->
+    process_flag(trap_exit, true),
+    ?HELP:register_name(?MODULE, self()),
+    
+    %% 初始化各种存储关系
+    init_relationship(),
+
+    %% 构建触发式任务
+    Tasks_config_file = ?TASKS_CONFIG,
+    build_datamsg_tasks(Tasks_config_file),
+
+    ok = proc_lib:init_ack(Parent, {ok, self()}),
+
+    %% 创建虚拟表
+    spawn_virtual_meters(),
+
+    State = #state{
+        parent = Parent
+    }, 
+
+    loop(State).
+
+loop(#state{parent = Parent} = State) ->
+    receive
+        {add_meters, MeterFieldList} ->
+            do_add_meters(MeterFieldList),
+            loop(State);
+        {del_meters, MeterTypeAndMeterList} ->
+            do_del_meters(MeterTypeAndMeterList),
+            loop(State);
+        {batch_update_build, MeterTypeAndMeterAndBuildIdList} ->
+            do_batch_update_build(MeterTypeAndMeterAndBuildIdList),
+            loop(State);
+        {delete_meters_by_gateway, Gateway} ->
+            do_delete_meters_by_gateway(Gateway),
+            loop(State);
+        {'EXIT', Parent, Reason} ->
+            exit(Reason);
+        %% 捕获与之连接的进程退出信息
+        {'EXIT', From, Reason} when(Reason =:= shutdown) orelse (Reason =:= normal) ->
+            ?ERROR("Pid:~p exit reason: ~p~n", [From, Reason]),
+            loop(State);
+        {'EXIT', From, Reason} ->
+            case analyze_meter_to_pid:lookup_by_pid(From) of
+                {ok, {Meter_type, Meter}} -> 
+                    ?ERROR("~p/~p is restart because: ~p~n", [Meter_type, Meter, Reason]),
+                    %% 重启虚拟表
+                    restart_meter(Meter_type, Meter);
+                {error, Reason} -> 
+                    ?ERROR("analyze_util:lookup_by_pid(~p) is error:~p~n", [From, Reason])
+            end,
+            loop(State);
+        {system, From, Request} ->
+            sys:handle_system_msg(Request, From, Parent, ?MODULE, [],
+                {State});
+        Other ->
+            ?ERROR("~p Other:~p~n", [?MODULE, Other]),
+            loop(State)
+    end.
+
+system_continue(_, _, {State}) ->
+    ?MODULE:loop(State).
+
+-spec system_terminate(any(), _, _, _) -> no_return().
+system_terminate(Reason, _, _, _) ->
+    analyze_meter_to_blob:close_table(),
+    exit(Reason).
+
+system_code_change(Misc, _, _, _) ->
+    {ok, Misc}.
+
+
+%% -------------------------------------------------
+%% Internal functions
+%% -------------------------------------------------
+
+%% 初始化虚拟表与相关进程的对应关系
+init_relationship() ->
+    %% 加载卡座活动流数据
+    analyze_realtime_workflow:load_workflow(),
+    %% 加载分体空调工作活动存储
+    analyze_meter_work_activities_store:load_activities(),
+    %% 表与进程id对应关系 
+    analyze_meter_to_pid:init(),
+    %% 数据上报对应的任务
+    analyze_datamsg_to_tasks:init(),
+    %% 表的最近上报的数据块
+    analyze_meter_to_blob:load_blob(),
+    %% 表的通讯质量
+    analyze_meter_to_cq:init(),
+    %% 设备的开关状态
+    analyze_meter_on_off_status:init(),
+    ok.
+
+%% 添加新的虚拟表监控
+do_add_meters(MeterFieldList) ->
+    Fun = 
+        fun(Meter_field) ->
+                {Meter_type, Meter} = analyze_meter_field:get_meter_type_and_meter_by_meter_field(Meter_field),    
+                case analyze_meter_field_store:lookup(Meter_type, Meter) of
+                    {ok, Meter_field} -> %% 此处特地使用bound的Meter_field
+                        %% Meter_field 未修改到，无需任何操作
+                        ok;
+                    _ ->
+                        Build_id = analyze_meter_field:get_build_id_by_meter_field(Meter_field),
+                        Gateway = analyze_meter_field:get_gateway_by_meter_field(Meter_field),
+                        handle_add_build_process(Build_id),
+                        handle_add_gateway_process(Gateway),
+                        spawn_meter(Meter_field)
+                end
+        end,
+    lists:foreach(Fun, MeterFieldList),
+    analyze_meter_field_server:insert_meter_field(MeterFieldList),
+    ok.
+
+%% 删除表监控
+do_del_meters(MeterTypeAndMeterList) ->
+    Fun = 
+        fun({Meter_type, Meter}) ->
+                case analyze_meter_field_store:lookup(Meter_type, Meter) of
+                    {ok, Meter_field} ->
+                        Build_id = analyze_meter_field:get_build_id_by_meter_field(Meter_field),
+                        Gateway = analyze_meter_field:get_gateway_by_meter_field(Meter_field),
+                        handle_del_build_process(Build_id, Meter_type, Meter),
+                        handle_del_gateway_process(Gateway, Meter_type, Meter),
+                        analyze_meter_field_server:delete_meter_field({Meter_type, Meter}),
+                        stop_meter(Meter_type, Meter),
+                        ok;
+                    {error, _Reason} ->
+                        ok
+                end
+        end,
+    lists:foreach(Fun, MeterTypeAndMeterList),
+    ok.
+    
+do_batch_update_build(MeterTypeAndMeterAndBuildIdList) ->
+    Fun = 
+        fun({Meter_type, Meter, Build_id}, AccIn) ->
+                case analyze_meter_field_store:lookup(Meter_type, Meter) of
+                    {ok, Meter_field} ->                        
+                        handle_del_build_process(Build_id, Meter_type, Meter),
+                        handle_add_build_process(Build_id),
+                        [analyze_meter_field:update_build_id(Meter_field, Build_id) | AccIn];
+                    _ ->
+                        AccIn
+                end
+        end,
+    MeterFieldList = lists:foldl(Fun, [], MeterTypeAndMeterAndBuildIdList),
+    analyze_meter_field_server:insert_meter_field(MeterFieldList),
+    ok.                         
+
+do_delete_meters_by_gateway(Gateway) ->
+    case analyze_gateway_meter:lookup(Gateway) of 
+        {ok, MeterTypeAndMeterList} ->
+            do_del_meters(MeterTypeAndMeterList);
+        _ ->
+            ok
+    end,
+    analyze_gateway_sup:remove_process(Gateway).            
+
+%% 处理建筑进程
+handle_add_build_process(Build_id) ->
+    case is_exist_build_process(Build_id) of
+        true ->
+            ok;
+        false ->
+            analyze_build_sup:create_process(Build_id)
+    end.
+
+handle_del_build_process(Build_id, Meter_type, Meter) ->
+    case analyze_build_meter:lookup(Build_id) of
+        {ok, [{Meter_type, Meter}]} ->
+            analyze_build_sup:remove_process(Build_id);
+        _ ->
+            ok
+    end.
+
+%% 检查是否存在build进程
+is_exist_build_process(Build_id) ->
+    case analyze_build_pid:lookup(Build_id) of
+        {ok, _Pid} ->
+            true;
+        {error, Reason} ->
+            false
+    end.
+
+%% 处理网关进程
+handle_add_gateway_process(Gateway) ->
+    case is_exist_gateway_process(Gateway) of
+        true ->
+            ok;
+        false ->
+            analyze_gateway_sup:create_process(Gateway)
+    end.
+
+handle_del_gateway_process(Gateway, Meter_type, Meter) ->
+    case analyze_gateway_meter:lookup(Gateway) of
+        {ok, [{Meter_type, Meter}]} ->
+            analyze_gateway_sup:remove_process(Gateway);
+        _ ->
+            ok
+    end.
+    
+
+%% 检查是否存在gateway进程
+is_exist_gateway_process(Gateway) ->
+    case analyze_gateway_pid:lookup(Gateway) of
+        {ok, _Pid} ->
+            true;
+        {error, Reason} ->
+            false
+    end.
+
+spawn_meter(Meter_field) ->
+    {Meter_type, Meter} = analyze_meter_field:get_meter_type_and_meter_by_meter_field(Meter_field),
+    stop_meter(Meter_type, Meter),
+    case is_exist_module(Meter_type) of
+        {ok, Child_module} ->
+            {ok, Pid} = Child_module:start_link(Meter_field),
+            insert_meter_process(Meter_type, Meter, Pid),
+            {ok, Pid};
+        {error, Reason} -> 
+            {error, Reason}
+    end.
+
+spawn_virtual_meters() ->
+    Fun =
+        fun(Meter_field, {Count, Start}) ->
+                try spawn_meter(Meter_field) of
+                    {ok, _Pid} ->
+                        {Count+1, Start+1};
+                    {error, Reason} ->
+                        ?ERROR("~p spawn error:~p~n", [Meter_field, Reason]), 
+                        {Count+1, Start}
+                catch 
+                    _Class:Reason ->
+                        ?ERROR("~p spawn error:~p~n", [Meter_field, Reason]),
+                        {Count+1, Start}
+                end
+        end,
+    {Count, Start} = analyze_meter_field_store:foldl(Fun, {0, 0}),
+    ?PRINT("Count ~p meters is Started ~p~n", [Count, Start]),
+    ok.
+
+stop_meter(Meter_type, Meter) ->
+    case analyze_util:get_running_pid(Meter_type, Meter) of
+        {ok, Pid} ->
+            exit(Pid, shutdown),
+            delete_meter_process({Meter_type, Meter});
+        {error, _What} ->
+            ok
+    end.
+    
+%% 构建虚拟表
+create_meter(Meter_field) ->
+    spawn_meter(Meter_field),
+    ok.
+
+%% 建立触发式任务
+build_datamsg_tasks(Tasks_config_file) ->
+    case file:consult(Tasks_config_file) of
+        {ok, Datamsg_tasks_list}->
+            %% 初始化触发式任务列表
+            set_datamsg_tasks(Datamsg_tasks_list);
+        {error, Reason} ->
+            ?ERROR("parse(~p) is error: ~p~n", [Tasks_config_file, file:format_error(Reason)]),
+            exit(Reason)
+    end.
+    
+%% 设定上报类型的任务列表
+set_datamsg_tasks(Datamsg_tasks_list)->
+    analyze_datamsg_to_tasks:insertAll(Datamsg_tasks_list).
+
+
+%% 是否存在对应表类型的虚拟设备模块
+is_exist_module(Meter_type) ->
+    case get_module_name_of_type(Meter_type) of
+        {ok, Child_module} ->
+            case is_loaded(Child_module) of
+                true          -> {ok, Child_module};
+                {error, What} -> {error, What}
+            end;
+        {error, Reason} -> {error, Reason}       
+    end.
+    
+%% 根据表类型获取对应的模块名
+get_module_name_of_type(Meter_type) ->
+    case lists:keyfind(Meter_type, 1, ?METER_TYPE_TO_MODULE)  of
+        {Meter_type, Module_name} -> {ok, Module_name};
+        false -> {error, not_found_module}
+    end.
+
+%% 模块是否加载
+is_loaded(Module) ->
+    case code:is_loaded(Module) of
+        false ->
+            case code:load_file(Module) of
+                {module, Module} -> true;
+                {error, What} -> {error, What}
+            end;
+        {file, _} ->
+            true
+    end.
+
+%% 建立表与虚拟表进程的关系
+insert_meter_process(Meter_type, Meter, Pid) ->
+    analyze_meter_to_pid:insert(Meter_type, Meter, Pid).
+
+%% 删除表与虚拟表进程的关系
+delete_meter_process({Meter_type, Meter}) ->
+    analyze_meter_to_pid:delete({Meter_type, Meter}).
+
+%% 重启虚拟表进程
+restart_meter(Meter_type, Meter) ->
+    case analyze_meter_field_store:lookup(Meter_type, Meter) of
+        {ok, Meter_field} ->
+            spawn_meter(Meter_field);
+        {error, What} ->
+            ?ERROR("analyze_meter_field_store:lookup(~p, ~p) is error:~p~n", [Meter_type, Meter, What])
+    end.

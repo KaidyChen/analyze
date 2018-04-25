@@ -1,0 +1,22 @@
+{application, analyze,
+ [
+  {description, "data analyze engine"},
+  {vsn, "1.0.1"},
+  {registered, []},
+  {applications, [
+                  kernel,
+                  stdlib,
+                  inets, %% http_client
+                  jsx,
+                  erlsom,
+                  ranch,    % TCP连接池
+                  cowboy,
+                  stdlib2,
+                  crontab,  % 定时任务库
+                  lager,     % 日志操作库
+                  lager_syslog,
+                  syslog
+                 ]},
+  {mod, { analyze_app, []}},
+  {env, []}
+ ]}.

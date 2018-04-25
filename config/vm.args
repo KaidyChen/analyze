@@ -1,0 +1,40 @@
+##------------------------------------------------------------------------
+## Name of the analyze node: Name@Host
+##------------------------------------------------------------------------
+
+-name analyze@127.0.0.1
+#-name analyze@10.168.1.165
+# or
+#-name analyze@localhost
+
+## Cookie for distributed erlang
+-setcookie analyzesecretcookie
+
+## Code path
+#-pa ebin deps/*/ebin 
+
+##-------------------------------------------------------------------------
+## Flags
+##-------------------------------------------------------------------------
+
+## Heartbeat management; auto-restarts VM if it dies or becomes unresponsive
+## (Disabled by default..use with caution!)
+##-heart
+
+-smp true
+#-smp false
+
+## Enable kernel poll and a few async threads
++K true
+
+## 12 threads/core
++A 48
+
+## Max process numbers
++P 2097152
+
+## Sets the maxinum number of simultaneously existing ports for this system
++Q 1048576
+
+-env ERL_CRASH_DUMP log/erl_crash.dump
+

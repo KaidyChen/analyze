@@ -1,0 +1,226 @@
+-module (analyze_build_sup).
+
+-behaviour(supervisor).
+
+-include("analyze.hrl").
+-include("analyze_config.hrl").
+-include("print.hrl").
+-include("time_table.hrl").
+
+-export([start_link/0]).
+
+-export([init/1]).
+
+-export([send_msg_to_server/1,
+         create_process/1,
+         remove_process/1
+        ]).
+
+-export([system_continue/3,
+         system_terminate/4,
+         system_code_change/4
+]).
+
+-define(ENERGY_TAB, energy_tab).
+
+-define(CHILD_MOD, analyze_build).
+-define(SERVER, ?MODULE).
+
+-record(state, {parent}).
+
+
+%%============================================================================================
+%% API
+%%============================================================================================
+
+start_link() ->
+    proc_lib:start_link(?MODULE, init, [self()]).
+
+init(Parent) ->
+    process_flag(trap_exit, true),
+    ?HELP:register_name(?MODULE, self()),
+
+    %% 初始化各种存储关系
+    init_relationship(),
+
+    Child_mod = ?CHILD_MOD,
+
+    spawn_virtual_build(),
+
+    State = #state{
+        parent = Parent
+    }, 
+    ok = proc_lib:init_ack(Parent, {ok, self()}),
+    loop(State).
+
+send_msg_to_server(Msg) ->
+    ?SERVER ! Msg.
+
+create_process(Build_id) ->
+    ?SERVER ! {create_process, Build_id}.
+
+remove_process(Build_id) ->
+    ?SERVER ! {remove_process, Build_id}.
+
+loop(#state{parent = Parent} = State) ->
+    receive
+        {create_process, Build_id} ->
+            do_create_process(Build_id),
+            loop(State);
+        {remove_process, Build_id} ->
+            do_remove_process(Build_id),
+            loop(State);
+        {'EXIT', Parent, Reason} ->
+            exit(Reason);
+        %% 捕获与之连接的进程退出信息
+        {'EXIT', From, Reason} when Reason =:= shutdown, Reason =:= normal ->
+            ?ERROR("Pid:~p exit reason: ~p~n", [From, Reason]),
+            loop(State);
+        {'EXIT', From, Reason} ->
+            ?ERROR("Pid:~p exit reason: ~p~n", [From, Reason]),
+            %% 重启
+            %restart_build(),
+            loop(State);
+        {system, From, Request} ->
+            sys:handle_system_msg(Request, From, Parent, ?MODULE, [],
+                {State});
+
+        %% 添加时间表
+        {add_time_table, Time_table_field} ->
+            add_time_table(Time_table_field),
+            loop(State);
+        Other ->
+            ?ERROR("Other:~p~n", [Other]),
+            loop(State)
+    end.
+
+system_continue(_, _, {State}) ->
+    loop(State).
+
+-spec system_terminate(any(), _, _, _) -> no_return().
+system_terminate(Reason, _, _, _) ->
+    exit(Reason).
+
+system_code_change(Misc, _, _, _) ->
+    {ok, Misc}.
+
+%% Internal functions
+
+init_relationship() ->
+    analyze_build_pid:init(),
+    analyze_build_time_table_store:load_time_table(),
+    ok.
+
+add_time_table(Time_table_field) ->
+    %{"0001000100020002",[["0a0001aa7k","ac"],["0a0001aa8k","lighting"]],{2016,8,21},{2017,1,20},[{1,[{{8,0},{12,0}},{{13,0},{18,0}},{{18,40},{21,30}}]},{2,[{{8,0},{12,0}},{{13,0},{18,0}},{{18,40},{21,30}}]}]}
+    ?ERROR("~p~n", [Time_table_field]),
+    {Room_id, Type_and_labels_of_meter_list, Level, Validity_date_start, Validity_date_end, Holiday_mode, Time_list} = Time_table_field,
+    Fun = fun
+        (Type_and_labels_of_meter) ->
+            Time_table_record = #time_table{
+                key = {Room_id, Type_and_labels_of_meter, Level},
+                room_id = Room_id,
+                type_and_labels_of_meter = Type_and_labels_of_meter,
+                level = Level,
+                validity_date_start = Validity_date_start,
+                validity_date_end = Validity_date_end,
+                holiday_mode = Holiday_mode,
+                time_list = Time_list
+            }
+    end,
+    Time_table_record_list = lists:map(Fun, Type_and_labels_of_meter_list),
+    analyze_build_time_table_store:insert(Time_table_record_list),
+    ok.
+
+spawn_virtual_build() ->    
+    spawn_virtual_room(),
+
+    ok.
+
+do_create_process(Build_id) ->
+    create_room_child(Build_id, analyze_build_room).
+
+do_remove_process(Build_id) ->
+    remove_room_child(Build_id).
+    
+create_room_child(Room_id, Child_mod) ->
+    {ok, Pid} = Child_mod:start_link(Room_id),
+    insert_to_build_pid_ets(Room_id, Pid),
+    {ok, Pid}.
+
+remove_room_child(Build_id) ->
+    case analyze_build_pid:lookup(Build_id) of
+        {ok, Pid} ->
+            exit(Pid, shutdown),
+            delete_from_build_pid_ets(Build_id);
+        {error, _Reason} ->
+            ok
+    end.
+
+spawn_virtual_room() ->
+    Fun =
+        fun(Item, {Count, Start}) ->
+                Room_id = analyze_build_meter:get_build_id(Item),
+                try create_room_child(Room_id, analyze_build_room) of
+                    {ok, _Pid} ->
+                        {Count+1, Start+1};
+                    {error, Reason} ->
+                        ?ERROR("~p spawn error:~p~n", [Room_id, Reason]), 
+                        {Count+1, Start}
+                catch 
+                    _Class:Reason ->
+                        ?ERROR("~p spawn error:~p~n", [Room_id, Reason]), 
+                        {Count+1, Start}
+                end
+        end,
+    {Count, Start} = analyze_build_meter:foldl(Fun, {0, 0}),
+    ?PRINT("Count ~p Build of meters is Started ~p~n", [Count, Start]),
+    ok.
+
+%% create build child
+create_build_child(Build_id, Opts, Child_mod) ->
+    {ok, Pid} = Child_mod:start_link(Build_id, Opts),
+    insert_to_build_pid_ets(Build_id, Pid),
+    ok.
+
+%% insert(Build_id, Pid) to ets
+insert_to_build_pid_ets(Build_id, Pid) ->
+    analyze_build_pid:insert(Build_id, Pid).
+
+delete_from_build_pid_ets(Build_id) ->
+    analyze_build_pid:delete(Build_id).
+
+get_classify_build_id_list(Build_id_list) ->
+    Fun = fun
+        (Build_id, {Room_id_list, Floor_id_list, Building_id_list, Garden_id_list}) ->
+            case length(Build_id) of
+                ?ROOM_ID_LEN -> 
+                    {[Build_id | Room_id_list], Floor_id_list, Building_id_list, Garden_id_list};
+                ?FLOOR_ID_LEN ->
+                    {Room_id_list, [Build_id | Floor_id_list], Building_id_list, Garden_id_list};
+                ?BUILDING_ID_LEN ->
+                    {Room_id_list, Floor_id_list, [Build_id | Building_id_list], Garden_id_list};
+                ?GARDEN_ID_LEN ->
+                    {Room_id_list, Floor_id_list, Building_id_list, [Build_id | Garden_id_list]};
+                _ ->
+                    {Room_id_list, Floor_id_list, Building_id_list, Garden_id_list}     
+            end
+    end,
+    lists:foldl(Fun, {[], [], [], []}, Build_id_list).
+
+%% 从建筑Id获取它上层的建筑Id
+get_upper_id(Build_id) when (length(Build_id) =:= ?ROOM_ID_LEN) ->
+    lists:sublist(Build_id, ?FLOOR_ID_LEN);
+get_upper_id(Build_id) when (length(Build_id) =:= ?FLOOR_ID_LEN) ->
+    lists:sublist(Build_id, ?BUILDING_ID_LEN);
+get_upper_id(Build_id) when (length(Build_id) =:= ?BUILDING_ID_LEN) ->
+    lists:sublist(Build_id, ?GARDEN_ID_LEN).
+
+
+
+
+
+
+
+
+
